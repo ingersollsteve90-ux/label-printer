@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebUSB PM43 Test</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 20px;
+    background: #111;
+    color: #eee;
+  }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  p.sub { color: #999; font-size: 13px; margin-top: 0; }
+  button {
+    font-size: 16px;
+    padding: 14px 20px;
+    margin: 8px 8px 8px 0;
+    border: none;
+    border-radius: 8px;
+    background: #2b6cb0;
+    color: #fff;
+    font-weight: bold;
+  }
+  button:disabled { background: #444; color: #888; }
+  button.danger { background: #b02b2b; }
+  #log {
+    margin-top: 16px;
+    background: #000;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 14px;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+  .ok { color: #6fdc6f; }
+  .err { color: #ff6b6b; }
+  .info { color: #7ec8e3; }
+</style>
+</head>
+<body>
+
+<h1>WebUSB PM43 Diagnostic</h1>
+<p class="sub">This page never leaves your tablet — no server, no third-party app. It talks to Chrome's WebUSB API directly.</p>
+
+<button id="btnConnect">1. Connect Printer</button>
+<button id="btnClaim" disabled>2. Claim Interface</button>
+<button id="btnTest" disabled>3. Send Test Label (ZPL)</button>
+<button id="btnDisconnect" disabled class="danger">Disconnect</button>
+
+<div id="log">Waiting... tap "Connect Printer" to begin.\n</div>
+
+<script>
+let device = null;
+let outEndpoint = null;
+
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+  const span = document.createElement('div');
+  if (cls) span.className = cls;
+  span.textContent = msg;
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+if (!('usb' in navigator)) {
+  log('WebUSB is NOT supported in this browser. This will not work here.', 'err');
+  document.getElementById('btnConnect').disabled = true;
+}
+
+document.getElementById('btnConnect').addEventListener('click', async () => {
+  try {
+    log('Requesting device... choose the PM43 from the picker.', 'info');
+    device = await navigator.usb.requestDevice({ filters: [] });
+    log('Device selected: ' + device.productName + ' (' + device.manufacturerName + ')', 'ok');
+    log('Vendor ID: 0x' + device.vendorId.toString(16) + '  Product ID: 0x' + device.productId.toString(16));
+
+    await device.open();
+    log('Device opened.', 'ok');
+
+    if (device.configuration === null) {
+      await device.selectConfiguration(1);
+      log('Configuration 1 selected.');
+    }
+
+    log('--- Configurations ---');
+    device.configurations.forEach((cfg, ci) => {
+      log('Config ' + ci + ': ' + cfg.interfaces.length + ' interface(s)');
+      cfg.interfaces.forEach((iface) => {
+        iface.alternates.forEach((alt) => {
+          log('  Interface ' + iface.interfaceNumber + ' alt ' + alt.alternateSetting +
+              ' | class=' + alt.interfaceClass + ' subclass=' + alt.interfaceSubclass + ' protocol=' + alt.interfaceProtocol);
+          alt.endpoints.forEach((ep) => {
+            log('    Endpoint ' + ep.endpointNumber + ' dir=' + ep.direction + ' type=' + ep.type + ' packetSize=' + ep.packetSize);
+          });
+        });
+      });
+    });
+
+    document.getElementById('btnClaim').disabled = false;
+    document.getElementById('btnDisconnect').disabled = false;
+    log('Now tap "Claim Interface" to try taking control of the printer interface.', 'info');
+  } catch (err) {
+    log('Connect failed: ' + err.message, 'err');
+  }
+});
+
+document.getElementById('btnClaim').addEventListener('click', async () => {
+  try {
+    const cfg = device.configuration;
+    let claimed = false;
+    for (const iface of cfg.interfaces) {
+      const alt = iface.alternates[0];
+      // Look for a bulk OUT endpoint - that's what we need to send print data
+      const out = alt.endpoints.find(e => e.direction === 'out' && e.type === 'bulk');
+      if (out) {
+        try {
+          await device.claimInterface(iface.interfaceNumber);
+          outEndpoint = { interfaceNumber: iface.interfaceNumber, endpointNumber: out.endpointNumber };
+          log('Claimed interface ' + iface.interfaceNumber + ', using OUT endpoint ' + out.endpointNumber, 'ok');
+          claimed = true;
+          break;
+        } catch (claimErr) {
+          log('Could not claim interface ' + iface.interfaceNumber + ': ' + claimErr.message, 'err');
+        }
+      }
+    }
+    if (!claimed) {
+      log('No claimable bulk OUT endpoint found. This printer may not be usable via WebUSB.', 'err');
+    } else {
+      document.getElementById('btnTest').disabled = false;
+      log('Ready. Tap "Send Test Label" to push a raw ZPL alignment box.', 'info');
+    }
+  } catch (err) {
+    log('Claim failed: ' + err.message, 'err');
+  }
+});
+
+document.getElementById('btnTest').addEventListener('click', async () => {
+  try {
+    const zpl = "^XA\n^PW812\n^LL1218\n^LH0,0\n^FO10,10^GB792,1198,3^FS\n^CF0,30\n^FO50,50^FDWEBUSB TEST^FS\n^XZ\n";
+    const data = new TextEncoder().encode(zpl);
+    log('Sending ' + data.length + ' bytes to endpoint ' + outEndpoint.endpointNumber + '...', 'info');
+    const result = await device.transferOut(outEndpoint.endpointNumber, data);
+    log('Transfer status: ' + result.status + ', bytesWritten: ' + result.bytesWritten, 'ok');
+    log('Check the printer now.', 'info');
+  } catch (err) {
+    log('Send failed: ' + err.message, 'err');
+  }
+});
+
+document.getElementById('btnDisconnect').addEventListener('click', async () => {
+  try {
+    if (device) {
+      if (outEndpoint) {
+        try { await device.releaseInterface(outEndpoint.interfaceNumber); } catch (e) {}
+      }
+      await device.close();
+      log('Device closed.', 'ok');
+    }
+  } catch (err) {
+    log('Disconnect error: ' + err.message, 'err');
+  }
+  device = null;
+  outEndpoint = null;
+  document.getElementById('btnClaim').disabled = true;
+  document.getElementById('btnTest').disabled = true;
+  document.getElementById('btnDisconnect').disabled = true;
+});
+</script>
+
+</body>
+</html>
